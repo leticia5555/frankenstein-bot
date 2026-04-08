@@ -1,0 +1,44 @@
+
+╔══════════════════════════════════════════════════════════════════╗
+║         v65 - FRANKENSTEIN (PICKY TRADER + XGBOOST)            ║
+╠══════════════════════════════════════════════════════════════════╣
+║  NEW: Data-driven filters from 33-trade analysis               ║
+║  • XGBoost ML model (replaces Random Forest)                   ║
+║  • RSI filter: no trading against extreme momentum             ║
+║  • Max entry 63¢: better risk/reward ratio                     ║
+║  • Requires book signal OR high ML confidence                  ║
+║  • No late entries (after minute 8)                            ║
+║  • Min EV raised to 8%                                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  MODES:                                                         ║
+║  python3 bot_v65.py --trade    # Trade with picky filters     ║
+║  python3 bot_v65.py --book     # Watch order book in real-time ║
+║  python3 bot_v65.py --analyze  # Analyze trade history         ║
+╚══════════════════════════════════════════════════════════════════╝
+
+[ML] XGBoost not available, using Random Forest
+[ML] (To enable XGBoost: brew install libomp)
+[ML] Using data from: btc_15m_data_v63.csv
+[ML] Loaded 133441 data points from 8773 candles
+[ML] Using 12 features
+[ML] ✅ Model trained! Accuracy: 78.3%
+[TRACKER] Found 16 existing trades
+=================================================================
+  v65 FRANKENSTEIN - PICKY TRADER MODE (XGBOOST + FILTERS)
+  Model accuracy: 78.3%
+  Min Expected Value: 8.0%
+  Max Entry Price: 58¢
+  RSI Limits: UP<95 DN>5
+  Min Time Left: 7m
+  Need: Book signal OR ML>72%
+=================================================================
+
+[01:17:45] Market: btc-updown-15m-1770423300
+[DEBUG] WS connected!
+
+[01:17:47] Connected to Binance ✓
+[DEBUG] msg#1 BTC=$70,188 market=True open=None
+
+[01:17:47] Joined candle | BTC: $70,187.90
+👀 BTC:+0.000% | RSI:50 | UP:38¢ DN:59¢ | 12.2m[DEBUG] msg#2 BTC=$70,188 market=True open=70187.9
+👀 BTC:-0.000% | RSI:50 | UP:40¢ DN:59¢ | 12.2m[DEBUG] msg#3 BTC=$70,188 market=True open=70187.9

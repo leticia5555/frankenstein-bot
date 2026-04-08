@@ -1,0 +1,370 @@
+import asyncio, json, websockets, requests
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions, BalanceAllowanceParams, AssetType
+from py_clob_client.order_builder.constants import BUY, SELL
+import os
+import time
+from dotenv import load_dotenv
+from datetime import datetime
+
+load_dotenv()
+
+client = ClobClient(
+    host="https://clob.polymarket.com", 
+    key=os.getenv("POLYMARKET_PRIVATE_KEY"), 
+    chain_id=137, 
+    signature_type=2, 
+    funder=os.getenv("POLYMARKET_FUNDER")
+)
+client.set_api_creds(client.create_or_derive_api_creds())
+
+# === SETTINGS ===
+TRADE_AMOUNT = 2
+MIN_EDGE = 0.12          # Need 12c edge minimum to enter
+MAX_PRICE = 0.55         # Don't buy if price > 55c (too expensive)
+PROFIT_TARGET = 0.05     # Take profit at +5c
+STOP_LOSS = 0.04         # Stop loss at -4c
+
+position = None
+SLUG = None
+tokens = None
+candle_open = None
+last_candle_time = None
+
+session_pnl = 0.0
+trade_count = 0
+win_count = 0
+
+
+def get_current_market_timestamp():
+    now = int(time.time())
+    return (now // 900) * 900
+
+
+def find_active_market():
+    global SLUG
+    
+    current_ts = get_current_market_timestamp()
+    
+    for offset in [0, 900, -900]:
+        timestamp = current_ts + offset
+        expected_slug = f"btc-updown-15m-{timestamp}"
+        
+        try:
+            r = requests.get(
+                f"https://gamma-api.polymarket.com/events?slug={expected_slug}",
+                timeout=5
+            )
+            data = r.json()
+            
+            if data and len(data) > 0:
+                event = data[0]
+                markets = event.get("markets", [])
+                if markets:
+                    market = markets[0]
+                    if market.get("acceptingOrders") and not market.get("closed"):
+                        if expected_slug != SLUG:
+                            print(f"\n{'='*50}")
+                            print(f"*** NEW MARKET: {expected_slug} ***")
+                            print(f"{'='*50}\n")
+                            SLUG = expected_slug
+                            return True
+                        return False
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    return False
+
+
+def get_tokens():
+    global tokens
+    tokens = None
+    
+    if not SLUG:
+        return None
+    
+    try:
+        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={SLUG}", timeout=5)
+        data = r.json()
+        
+        if data:
+            markets = data[0].get("markets", [])
+            if markets:
+                m = markets[0]
+                clob_ids = m.get("clobTokenIds", "[]")
+                t = json.loads(clob_ids) if isinstance(clob_ids, str) else clob_ids
+                
+                if t and len(t) >= 2:
+                    tokens = {"up_t": t[0], "dn_t": t[1]}
+                    print(f"Tokens loaded ✓")
+                    return tokens
+    except Exception as e:
+        print(f"Token error: {e}")
+    
+    return None
+
+
+def set_allowances():
+    t = get_tokens()
+    if not t:
+        return False
+    
+    try:
+        params1 = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=t["up_t"])
+        client.update_balance_allowance(params1)
+        params2 = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=t["dn_t"])
+        client.update_balance_allowance(params2)
+        print("Allowances set ✓")
+        return True
+    except Exception as e:
+        print(f"Allowance error: {e}")
+        return False
+
+
+def get_prices():
+    if not tokens:
+        return None
+    
+    try:
+        up = float(client.get_price(tokens["up_t"], "buy").get("price", 0))
+        dn = float(client.get_price(tokens["dn_t"], "buy").get("price", 0))
+        return {"up": up, "dn": dn, "up_t": tokens["up_t"], "dn_t": tokens["dn_t"]}
+    except:
+        return None
+
+
+def get_binance_candle():
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "15m", "limit": 1},
+            timeout=5
+        )
+        data = r.json()[0]
+        return data[0], float(data[1])
+    except:
+        return None, None
+
+
+def buy(token, price, side):
+    global position
+    
+    try:
+        print(f"\n>>> BUYING {side} at ~{price*100:.0f}c")
+        opt = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+        mo = MarketOrderArgs(token_id=token, amount=TRADE_AMOUNT, side=BUY)
+        order = client.create_market_order(mo, opt)
+        resp = client.post_order(order, OrderType.FOK)
+        
+        if resp.get("success") and resp.get("status") == "matched":
+            usdc_spent = float(resp.get("makingAmount", 0))
+            shares_received = float(resp.get("takingAmount", 0))
+            fill_price = usdc_spent / shares_received if shares_received > 0 else price
+            
+            position = {
+                "token": token, 
+                "entry_price": fill_price,
+                "size": shares_received, 
+                "side": side, 
+                "cost": usdc_spent
+            }
+            print(f"    ✓ BOUGHT {shares_received:.2f} @ {fill_price*100:.0f}c (${usdc_spent:.2f})")
+            return True
+        else:
+            print(f"    ✗ Not filled")
+    except Exception as e:
+        print(f"    ✗ Error: {e}")
+    
+    return False
+
+
+def sell(reason):
+    global position, session_pnl, trade_count, win_count
+    
+    if not position:
+        return False
+    
+    try:
+        print(f"\n<<< SELLING {position['side']} - {reason}")
+        
+        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=position["token"])
+        bal = client.get_balance_allowance(params)
+        raw_balance = int(bal.get("balance", 0))
+        actual_shares = raw_balance / 1_000_000
+        
+        if actual_shares <= 0:
+            print("    No shares!")
+            position = None
+            return False
+        
+        opt = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+        mo = MarketOrderArgs(token_id=position["token"], amount=actual_shares, side=SELL)
+        order = client.create_market_order(mo, opt)
+        resp = client.post_order(order, OrderType.FOK)
+        
+        if resp.get("success") and resp.get("status") == "matched":
+            usdc_received = float(resp.get("takingAmount", 0))
+            cost = position["cost"]
+            pnl = usdc_received - cost
+            
+            session_pnl += pnl
+            trade_count += 1
+            if pnl > 0:
+                win_count += 1
+            
+            emoji = "✅" if pnl > 0 else "❌"
+            print(f"    {emoji} SOLD @ ${usdc_received:.2f} | P/L: ${pnl:+.2f}")
+            print(f"    Session: {win_count}/{trade_count} wins | Total: ${session_pnl:+.2f}")
+            
+            position = None
+            return True
+        else:
+            print(f"    ✗ Sell failed, retrying...")
+            return False
+            
+    except Exception as e:
+        print(f"    ✗ Error: {e}")
+        return False
+
+
+def check_for_new_candle():
+    global last_candle_time, candle_open
+    
+    new_time, new_open = get_binance_candle()
+    if new_time is None:
+        return False
+    
+    if new_time != last_candle_time:
+        print(f"\n*** NEW CANDLE: ${new_open:,.2f} ***\n")
+        last_candle_time = new_time
+        candle_open = new_open
+        return True
+    return False
+
+
+def check_for_new_market():
+    global position
+    
+    is_new = find_active_market()
+    if is_new:
+        if position:
+            sell("MARKET CHANGE")
+        get_tokens()
+        set_allowances()
+        return True
+    return False
+
+
+async def main():
+    global position, candle_open, tokens, last_candle_time
+    
+    print("=" * 60)
+    print("  BOT v5 - BUY BIGGEST EDGE")
+    print("=" * 60)
+    print(f"Min Edge: {MIN_EDGE*100:.0f}c | Max Price: {MAX_PRICE*100:.0f}c")
+    print(f"TP: +{PROFIT_TARGET*100:.0f}c | SL: -{STOP_LOSS*100:.0f}c")
+    print("=" * 60)
+    
+    find_active_market()
+    if not SLUG:
+        print("ERROR: No active market!")
+        return
+    
+    get_tokens()
+    set_allowances()
+    last_candle_time, candle_open = get_binance_candle()
+    
+    print(f"Market: {SLUG}")
+    print(f"Candle: ${candle_open:,.2f}\n")
+    
+    tick_count = 0
+    
+    while True:
+        try:
+            async with websockets.connect(
+                "wss://stream.binance.com:9443/ws/btcusdt@trade",
+                ping_interval=20,
+                ping_timeout=10
+            ) as ws:
+                
+                async for msg in ws:
+                    tick_count += 1
+                    
+                    if tick_count % 10 != 0:
+                        continue
+                    
+                    d = json.loads(msg)
+                    btc_now = float(d['p'])
+                    
+                    if tick_count % 50 == 0:
+                        if check_for_new_candle():
+                            check_for_new_market()
+                    
+                    if tick_count % 100 == 0:
+                        check_for_new_market()
+                    
+                    if not tokens:
+                        continue
+                    
+                    m = get_prices()
+                    if not m or m["up"] == 0:
+                        continue
+                    
+                    if candle_open is None or candle_open == 0:
+                        continue
+                    
+                    btc_change = ((btc_now - candle_open) / candle_open) * 100
+                    
+                    # Calculate fair value and edge for both sides
+                    # Simple model: if BTC up, UP should be worth more
+                    up_fair = min(0.85, 0.50 + btc_change * 5)  # More aggressive fair value
+                    dn_fair = min(0.85, 0.50 - btc_change * 5)
+                    
+                    up_edge = up_fair - m["up"]
+                    dn_edge = dn_fair - m["dn"]
+                    
+                    # HOLDING POSITION
+                    if position:
+                        curr = m["up"] if position["side"] == "UP" else m["dn"]
+                        price_diff = curr - position["entry_price"]
+                        est_pnl = price_diff * position["size"]
+                        
+                        # Show current edge for our side
+                        our_edge = up_edge if position["side"] == "UP" else dn_edge
+                        
+                        print(f"HOLD {position['side']} | {position['entry_price']*100:.0f}c→{curr*100:.0f}c ({price_diff*100:+.0f}c) | ~${est_pnl:+.2f} | BTC:{btc_change:+.2f}%")
+                        
+                        # Exit conditions
+                        if price_diff >= PROFIT_TARGET:
+                            sell(f"PROFIT +{price_diff*100:.0f}c")
+                        elif price_diff <= -STOP_LOSS:
+                            sell(f"STOP -{abs(price_diff)*100:.0f}c")
+                    
+                    # LOOKING FOR ENTRY - BUY BIGGEST EDGE
+                    else:
+                        # Find which side has better edge
+                        if up_edge > dn_edge:
+                            best_side = "UP"
+                            best_edge = up_edge
+                            best_price = m["up"]
+                            best_token = m["up_t"]
+                        else:
+                            best_side = "DN"
+                            best_edge = dn_edge
+                            best_price = m["dn"]
+                            best_token = m["dn_t"]
+                        
+                        print(f"BTC:{btc_change:+.2f}% | UP:{m['up']*100:.0f}c({up_edge*100:+.0f}c) DN:{m['dn']*100:.0f}c({dn_edge*100:+.0f}c) | Best:{best_side} +{best_edge*100:.0f}c")
+                        
+                        # Buy if edge is good AND price is cheap
+                        if best_edge >= MIN_EDGE and best_price <= MAX_PRICE:
+                            print(f"*** {best_side} SIGNAL: +{best_edge*100:.0f}c edge @ {best_price*100:.0f}c ***")
+                            buy(best_token, best_price, best_side)
+        
+        except Exception as e:
+            print(f"\nError: {e}")
+            await asyncio.sleep(3)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
