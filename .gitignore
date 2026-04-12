@@ -7,3 +7,5 @@ frank_v13_session.csv
 frank_v13_clean_*.csv
 frank_v13_merged.csv
 *.json
+*.csv
+*.json
