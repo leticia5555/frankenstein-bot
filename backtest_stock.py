@@ -419,6 +419,15 @@ def main():
     label, why = verdict(oos_stats)
     print(f"  VERDICT: {label}")
     print(f"  {why}")
+    # Don't let a dollar-profit verdict be mistaken for a real directional edge.
+    # If the signal's out-of-sample win rate trails the base rate, it predicts
+    # direction WORSE than buying randomly — any profit is coming from the size
+    # of the winners, not from being right more often.
+    if oos_stats["n"] and oos_stats["win_rate"] < br:
+        print(f"  CAVEAT: out-of-sample win rate "
+              f"({oos_stats['win_rate'] * 100:.2f}%) trails the base rate "
+              f"({br * 100:.2f}%) — predicts direction WORSE than random; "
+              f"any profit is from trade SIZE, not hit rate.")
     if len(trades) < LOW_SAMPLE * 2:
         print(f"  WARNING: only {len(trades)} total fires — small sample, "
               f"treat as low-confidence.")
