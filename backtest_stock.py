@@ -103,46 +103,74 @@ def fetch_yahoo(ticker, rng="2y", interval="1d"):
     )
 
 
-def load_csv(path):
-    """Load (dates, closes) from a local CSV — an offline fallback.
+# Header names that mean "the closing price", in priority order. Includes the
+# Nasdaq/Nasdaq.com export header "Close/Last".
+CLOSE_HEADERS = ("close/last", "adj close", "adjclose", "close")
+DATE_HEADERS = ("date", "timestamp")
 
-    Looks for a 'close' column (case-insensitive); for the date it tries
-    'date' / 'timestamp', else just uses the row index. Falls back to the last
-    numeric column if there's no header named 'close'. Oldest row first.
+
+def _clean_price(s):
+    """Parse a price cell that may carry $ signs, commas, or quotes/spaces."""
+    return float(s.strip().lstrip("$").replace(",", "").replace('"', ""))
+
+
+def _date_key(s):
+    """Parse a date string to a sortable datetime; None if unrecognized."""
+    import datetime as _dt
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y"):
+        try:
+            return _dt.datetime.strptime(s.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def load_csv(path):
+    """Load (dates, closes) from a local CSV — an offline data source.
+
+    Handles real-world exports: a 'Close/Last' or 'Close'/'Adj Close' column
+    (case-insensitive), prices with '$'/commas, and either row order. Yahoo
+    exports oldest-first; Nasdaq exports newest-first — so if the date column
+    parses, we sort ascending (oldest first) which RSI and the 70/30 split
+    require. Falls back to the last numeric column if there's no close header.
     """
-    dates, closes = [], []
     with open(path, newline="") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+        rows = list(csv.reader(f))
     if not rows:
         raise SystemExit(f"{path} is empty.")
 
     header = [h.strip().lower() for h in rows[0]]
-    has_header = any(h in ("close", "adj close", "adjclose") for h in header)
+    close_idx = next((header.index(h) for h in CLOSE_HEADERS if h in header), None)
 
-    if has_header:
-        for name in ("close", "adj close", "adjclose"):
-            if name in header:
-                close_idx = header.index(name)
-                break
-        date_idx = next((header.index(n) for n in ("date", "timestamp")
-                         if n in header), None)
+    if close_idx is not None:
+        date_idx = next((header.index(h) for h in DATE_HEADERS if h in header), None)
         body = rows[1:]
     else:
-        # No recognizable header: assume last column is the close.
+        # No recognizable close header: assume last column is the close.
         close_idx = len(rows[0]) - 1
         date_idx = 0 if len(rows[0]) > 1 else None
         body = rows
 
+    parsed = []  # (date_str, close_float)
     for i, row in enumerate(body):
         try:
-            c = float(row[close_idx])
+            c = _clean_price(row[close_idx])
         except (ValueError, IndexError):
-            continue
-        closes.append(c)
-        dates.append(row[date_idx] if date_idx is not None else str(i))
-    if not closes:
+            continue  # skip blank/malformed rows
+        date_str = row[date_idx] if date_idx is not None else str(i)
+        parsed.append((date_str, c))
+
+    if not parsed:
         raise SystemExit(f"No numeric closes found in {path}.")
+
+    # Normalize to oldest-first. If every date parses, sort by real date;
+    # otherwise leave file order untouched.
+    keys = [_date_key(d) for d, _ in parsed]
+    if all(k is not None for k in keys):
+        parsed = [p for _, p in sorted(zip(keys, parsed), key=lambda x: x[0])]
+
+    dates = [d for d, _ in parsed]
+    closes = [c for _, c in parsed]
     return dates, closes
 
 

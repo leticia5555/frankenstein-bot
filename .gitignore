@@ -9,3 +9,6 @@ frank_v13_merged.csv
 *.json
 *.csv
 *.json
+
+AAPL.csv
+NVDA.csv
