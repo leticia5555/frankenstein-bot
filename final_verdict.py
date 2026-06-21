@@ -260,5 +260,112 @@ def _demo():
     print("=" * 72)
 
 
+def _print_cli_result(args, p, oos, res, K, lifetime):
+    oos_txt = {True: "confirmado (70/30)", False: "falló (70/30)",
+               None: "no disponible"}[oos]
+    print("=" * 64)
+    print("  FINAL VERDICT  (raw p -> K-adjusted -> OOS-confirmed)")
+    print("=" * 64)
+    print(f"  rule         : {args.rule}")
+    print(f"  predict      : {args.predict}")
+    print(f"  market/horiz : {args.market} / {args.horizon}")
+    print(f"  data         : {args.data}")
+    print(f"  user         : {args.user}")
+    print(f"  hypothesis   : {args.hypothesis}")
+    print("-" * 64)
+    print(f"  raw p-value  : {p:.4f}" if p is not None else "  raw p-value  : N/A")
+    print(f"  K (this idea): {K}    | lifetime: {lifetime}")
+    if res is not None:
+        print(f"  threshold    : {res['threshold']:.4f}  (0.05/K)")
+    print(f"  OOS status   : {oos_txt}")
+    print("-" * 64)
+    final = res["final"] if res else INSUFICIENTE
+    explain = res["explain"] if res else (
+        "Sin trades in-sample: no se puede calcular un p-value, así que no se "
+        "registra ni se juzga (falta la Puerta 1).")
+    print(f"  FINAL: {final}")
+    print(f"  {explain}")
+    print("=" * 64)
+
+
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="final_verdict.py",
+        description="Score a signal rule through the full credibility chain: "
+                    "raw p-value -> K-adjusted (Bonferroni) -> OOS-confirmed "
+                    "(70/30). Prints ONE final verdict naming the gate it failed.",
+        epilog='Example:\n'
+               '  python3 final_verdict.py "rsi < 30" --predict DN '
+               '--user leticia --hypothesis "rsi_dip" '
+               '--data btc_15m_data_v63.csv',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("rule", nargs="?",
+                        help='Signal rule, e.g. "rsi < 30" or "momentum_3m > 0.5".')
+    parser.add_argument("--predict", choices=["UP", "DN"], default="UP",
+                        help="Direction the signal predicts (default: UP).")
+    parser.add_argument("--user", help="User id (for K-tracking).")
+    parser.add_argument("--hypothesis",
+                        help="Hypothesis/idea label that groups variations for K.")
+    parser.add_argument("--data", default=None,
+                        help="BTC CSV (default: validate.py's DATA_FILE).")
+    parser.add_argument("--market", default="BTC", help="Market tag (default: BTC).")
+    parser.add_argument("--horizon", default="15m",
+                        help="Horizon tag (default: 15m).")
+    parser.add_argument("--entry-cfg", default="",
+                        help="Entry config string (part of the fingerprint).")
+    parser.add_argument("--db", default="ktrack.db",
+                        help="SQLite file for K history (default: ktrack.db; "
+                             "use ':memory:' for an ephemeral run).")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run the built-in demonstration instead of scoring.")
+    args = parser.parse_args(argv)
+
+    if args.demo:
+        _demo()
+        return 0
+
+    # Validate required args (don't fabricate).
+    missing = [name for name in ("rule", "user", "hypothesis")
+               if not getattr(args, name)]
+    if missing:
+        parser.error("missing required argument(s): " + ", ".join(missing)
+                     + " (use --help)")
+
+    import validate
+    if args.data is None:
+        args.data = validate.DATA_FILE
+
+    # Compute the raw p-value and OOS confirmation from validate.py.
+    try:
+        p, oos = validate_btc_oos(args.rule, predict=args.predict, data=args.data)
+    except FileNotFoundError:
+        parser.error(f"data file not found: {args.data}")
+        return 2
+
+    tracker = KTracker(args.db)
+    try:
+        if p is None:
+            # No in-sample trades -> can't compute a p-value -> don't record.
+            K = tracker.k(args.user, args.hypothesis)
+            lifetime = tracker.lifetime_k(args.user)
+            _print_cli_result(args, None, oos, None, K, lifetime)
+            return 0
+
+        formula = f"{args.rule} :: predict {args.predict}"
+        res = evaluate(
+            tracker, user_id=args.user, hypothesis=args.hypothesis,
+            formula=formula, market=args.market, horizon=args.horizon,
+            entry_cfg=args.entry_cfg, p_value=p, oos_confirmed=oos,
+        )
+        _print_cli_result(args, p, oos, res, res["K"], res["lifetime_k"])
+        return 0
+    finally:
+        tracker.close()
+
+
 if __name__ == "__main__":
-    _demo()
+    import sys
+    sys.exit(main())
